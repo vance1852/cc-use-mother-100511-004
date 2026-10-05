@@ -9,8 +9,20 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .release_gate import ReleaseGateService
 from .service import DomainService
 from .storage import Database
+
+
+def _created_or_replayed(result: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    return (200 if result.get("replayed") else 201), result
+
+
+def _required_query(parsed, name: str) -> str:
+    value = parse_qs(parsed.query).get(name, [""])[0]
+    if not value:
+        raise ValidationError(f"{name} 不能为空")
+    return value
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
@@ -48,6 +60,43 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        if method == "POST" and parsed.path == "/release-candidates":
+            return _created_or_replayed(service.register_candidate(actor_id=actor_id, **body))
+        if method == "GET" and parsed.path == "/release-candidates":
+            query = parse_qs(parsed.query)
+            model_name = query.get("model_name", [None])[0]
+            return 200, {"items": service.list_candidates(model_name)}
+        if method == "POST" and parsed.path == "/assessment-batches":
+            return _created_or_replayed(service.submit_batch(actor_id=actor_id, **body))
+        if method == "GET" and parsed.path == "/assessment-batches":
+            candidate_id = _required_query(parsed, "candidate_id")
+            return 200, {"items": service.list_batches(candidate_id)}
+        if method == "POST" and parsed.path == "/assessment-batch-completions":
+            return _created_or_replayed(service.complete_batch(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/findings":
+            return _created_or_replayed(service.add_finding(actor_id=actor_id, **body))
+        if method == "GET" and parsed.path == "/findings":
+            candidate_id = _required_query(parsed, "candidate_id")
+            return 200, {"items": service.list_findings(candidate_id)}
+        if method == "POST" and parsed.path == "/finding-resolutions":
+            return _created_or_replayed(service.resolve_finding(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/finding-reopens":
+            return _created_or_replayed(service.reopen_finding(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/exception-approvals":
+            return _created_or_replayed(service.approve_exception(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/exception-revocations":
+            return _created_or_replayed(service.revoke_exception(actor_id=actor_id, **body))
+        if method == "POST" and parsed.path == "/release-decisions":
+            return _created_or_replayed(service.generate_decision(actor_id=actor_id, **body))
+        if method == "GET" and parsed.path == "/release-decisions":
+            candidate_id = _required_query(parsed, "candidate_id")
+            return 200, {"items": service.list_decisions(candidate_id)}
+        if method == "GET" and parsed.path == "/release-decisions/current":
+            candidate_id = _required_query(parsed, "candidate_id")
+            return 200, service.current_decision(candidate_id)
+        if method == "GET" and parsed.path == "/release-gate/status":
+            candidate_id = _required_query(parsed, "candidate_id")
+            return 200, service.gate_status(candidate_id)
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -93,13 +142,13 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> int:
     """启动本地 HTTP 服务。"""
 
-    parser = argparse.ArgumentParser(description="启动科技战略协作基础服务")
+    parser = argparse.ArgumentParser(description="启动人工智能治理与模型发布门禁服务")
     parser.add_argument("--database", default="service.sqlite3")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    Handler.service = ReleaseGateService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
