@@ -9,18 +9,21 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .gate_service import GateService
 from .service import DomainService
 from .storage import Database
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          gate_service: GateService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    gate = gate_service
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
@@ -48,6 +51,10 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        if gate is not None:
+            status, payload = _route_gate(gate, method, parsed, body, actor_id)
+            if status is not None:
+                return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -55,10 +62,71 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
         return 400, {"error": "invalid_request", "message": str(exc)}
 
 
+def _route_gate(gate: GateService, method: str, parsed, body: dict[str, Any],
+                actor_id: str) -> tuple[int | None, dict[str, Any]]:
+    """分派模型发布门禁相关接口。"""
+
+    query = parse_qs(parsed.query)
+
+    def receipt_response(receipt) -> tuple[int, dict[str, Any]]:
+        return 200 if receipt.replayed else 201, receipt.__dict__
+
+    if method == "POST":
+        if parsed.path == "/release-candidates":
+            return receipt_response(gate.register_candidate(actor_id=actor_id, **body))
+        if parsed.path == "/evaluation-batches":
+            return receipt_response(gate.register_batch(actor_id=actor_id, **body))
+        if parsed.path == "/evaluation-batches/complete":
+            return receipt_response(gate.complete_batch(actor_id=actor_id, **body))
+        if parsed.path == "/findings":
+            return receipt_response(gate.record_finding(actor_id=actor_id, **body))
+        if parsed.path == "/findings/reopen":
+            return receipt_response(gate.reopen_finding(actor_id=actor_id, **body))
+        if parsed.path == "/remediation-evidence":
+            return receipt_response(gate.add_evidence(actor_id=actor_id, **body))
+        if parsed.path == "/exceptions":
+            return receipt_response(gate.approve_exception(actor_id=actor_id, **body))
+        if parsed.path == "/exceptions/revoke":
+            return receipt_response(gate.revoke_exception(actor_id=actor_id, **body))
+        if parsed.path == "/release-decisions":
+            return receipt_response(gate.generate_decision(actor_id=actor_id, **body))
+    if method == "GET":
+        if parsed.path == "/release-candidates":
+            candidate_id = query.get("candidate_id", [""])[0]
+            if not candidate_id:
+                raise ValidationError("candidate_id 不能为空")
+            return 200, gate.get_candidate(candidate_id).__dict__
+        if parsed.path == "/gate-status":
+            candidate_id = query.get("candidate_id", [""])[0]
+            if not candidate_id:
+                raise ValidationError("candidate_id 不能为空")
+            return 200, gate.current_status(candidate_id)
+        if parsed.path == "/release-decisions":
+            candidate_id = query.get("candidate_id", [""])[0]
+            if candidate_id:
+                return 200, {"items": gate.list_decisions(candidate_id)}
+            decision_id = query.get("decision_id", [""])[0]
+            if not decision_id:
+                raise ValidationError("candidate_id 或 decision_id 不能为空")
+            return 200, gate.get_decision(decision_id)
+        if parsed.path == "/findings":
+            candidate_id = query.get("candidate_id", [""])[0]
+            if not candidate_id:
+                raise ValidationError("candidate_id 不能为空")
+            return 200, {"items": [item.__dict__ for item in gate.list_findings(candidate_id)]}
+        if parsed.path == "/exceptions":
+            candidate_id = query.get("candidate_id", [""])[0]
+            if not candidate_id:
+                raise ValidationError("candidate_id 不能为空")
+            return 200, {"items": [item.__dict__ for item in gate.list_exceptions(candidate_id)]}
+    return None, {}
+
+
 class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    gate_service: GateService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +137,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                gate_service=self.gate_service)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +169,7 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    Handler.gate_service = GateService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
